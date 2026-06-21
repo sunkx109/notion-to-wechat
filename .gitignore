@@ -1,0 +1,13 @@
+.env
+*.pyc
+__pycache__/
+*.json
+!package.json
+!package-lock.json
+page_*.json
+dist/
+*.egg-info/
+.venv/
+venv/
+*.html
+node_modules/
