@@ -35,7 +35,6 @@ def load_config(config_path: str = "config.yaml") -> dict:
     env_overrides = {
         "notion": {"api_key": "NOTION_API_KEY", "database_id": "NOTION_DATABASE_ID"},
         "wechat": {"app_id": "WECHAT_APP_ID", "app_secret": "WECHAT_APP_SECRET"},
-        "zhihu": {"cookie_string": "ZHIHU_COOKIE"},
     }
 
     for section, keys in env_overrides.items():

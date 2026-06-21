@@ -1,13 +1,16 @@
 .env
 *.pyc
 __pycache__/
-*.json
-!package.json
-!package-lock.json
-page_*.json
-dist/
-*.egg-info/
-.venv/
-venv/
+
+# Runtime-generated files
+notion-publisher/login_img/
+notion-publisher/mds/
+notion-publisher/mdnice_storage.json
+notion-publisher/wechat_storage.json
+mdnice_storage.json
+wechat_storage.json
+
+# Legacy generated files (project root)
+login_img/
+mds/
 *.html
-node_modules/

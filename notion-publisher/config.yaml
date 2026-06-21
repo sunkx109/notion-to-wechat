@@ -1,0 +1,9 @@
+# Notion → 微信公众号 配置
+# 敏感信息优先通过 .env 环境变量设置
+
+notion:
+  api_key: "your-notion-api-key-here"
+
+wechat:
+  app_id: "your-wechat-app-id"
+  app_secret: "your-wechat-app-secret"

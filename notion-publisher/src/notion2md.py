@@ -39,6 +39,12 @@ def _rich_text_to_md(rich_text_list: list[dict]) -> str:
         # Markdown 转义 (*, _, [, ], `, ~ 等)
         text = _escape_md(text)
 
+        # 提取首尾空格，防止空格在格式标记内导致 Markdown 解析失败
+        # 例如 " text" (bold) → "** text**" 无效，应为 " **text**"
+        leading = " " * (len(text) - len(text.lstrip(" ")))
+        trailing = " " * (len(text) - len(text.rstrip(" ")))
+        text = text.strip(" ")
+
         # 一层层包裹格式
         if annotations.get("code"):
             text = f"`{text}`"
@@ -51,6 +57,9 @@ def _rich_text_to_md(rich_text_list: list[dict]) -> str:
 
         if annotations.get("strikethrough"):
             text = f"~~{text}~~"
+
+        # 将首尾空格放回格式标记外侧
+        text = leading + text + trailing
 
         # 链接
         if href and not annotations.get("code"):
@@ -298,15 +307,6 @@ class NotionToMarkdown:
             return self.convert(children)
         return ""
 
-    def _fallback(self, block: dict) -> str:
-        """未支持的类型，尝试提取文本"""
-        btype = block.get("type", "unknown")
-        content = block.get(btype, {})
-        rich_text = content.get("rich_text", [])
-        if rich_text:
-            return _rich_text_to_md(rich_text)
-        return f"<!-- unsupported: {btype} -->"
-
     # ─── 列表合并处理 ───
 
     def _convert_list_block(self, blocks: list[dict], start: int, item_type: str) -> tuple[str, int]:
@@ -365,3 +365,19 @@ class NotionToMarkdown:
         import re
         md = re.sub(r"\n{3,}", "\n\n", md)
         return md.strip()
+
+    def _fallback(self, block: dict) -> str:
+        """未支持的类型，尝试提取文本"""
+        btype = block.get("type", "unknown")
+        content = block.get(btype, {})
+        rich_text = content.get("rich_text", [])
+        if rich_text:
+            return _rich_text_to_md(rich_text)
+        return f"<!-- unsupported: {btype} -->"
+
+
+def convert_json_to_markdown(data: dict) -> str:
+    """将 Notion blocks JSON 转为 Markdown 字符串"""
+    blocks = data.get("blocks", [])
+    converter = NotionToMarkdown()
+    return converter.convert(blocks)

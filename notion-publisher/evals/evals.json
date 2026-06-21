@@ -1,0 +1,42 @@
+{
+  "skill_name": "notion-publisher",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "帮我把这篇 Notion 文章发布到微信公众号，链接是 https://www.notion.so/sunkx109/AI-Future-38324043556480c49193fbe0a6f72c51，只保存草稿就好，我审核后再手动发布。",
+      "expected_output": "Skill 应触发，Claude 应：(1) 认出 Notion 发布需求 (2) 提取 page-id (3) 询问或直接执行 mdnice_publish.py (4) 提供微信公众号发布步骤",
+      "files": [],
+      "assertions": [
+        "正确提取 Notion 页面 ID",
+        "识别微信公众号发布需求",
+        "仅保存草稿不发布",
+        "使用项目已有工具 mdnice_publish.py",
+        "有清晰的步骤化流程"
+      ]
+    },
+    {
+      "id": 2,
+      "prompt": "我写了一篇技术文章在 Notion 里，有代码块和数学公式，想发到公众号上。排版格式老是出问题，能帮我处理一下吗？",
+      "expected_output": "Skill 应触发，Claude 应：(1) 识别出这是 Notion→微信发布场景 (2) 询问 Notion 页面 ID/URL (3) 提到 mdnice 渲染引擎和代码高亮/KaTeX 支持",
+      "files": [],
+      "assertions": [
+        "询问 Notion 页面 ID/URL",
+        "提到代码语法高亮方案",
+        "提到数学公式渲染方案",
+        "引用 mdnice 渲染引擎",
+        "包含格式检查和质量验证"
+      ]
+    },
+    {
+      "id": 3,
+      "prompt": "Notion API 的 query_database 接口怎么用？我想写个脚本自动扫描数据库里待发布的文章。",
+      "expected_output": "Skill 不应触发。用户问的是 Notion API 编程问题，不是直接的发布操作。但 Claude 可以提到项目中已有的 src/notion_client.py 作为 Notion API 调用的参考。",
+      "files": [],
+      "assertions": [
+        "正确回答 API 技术问题",
+        "不应触发发布工作流（应为 false positive 测试）",
+        "引用项目现有代码 src/notion_client.py 作为参考"
+      ]
+    }
+  ]
+}
