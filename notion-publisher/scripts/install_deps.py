@@ -136,32 +136,31 @@ def check_python_deps(project_dir: str) -> bool:
 
 
 def check_config(project_dir: str) -> bool:
-    """检查 config.yaml 是否已配置"""
-    config_path = Path(project_dir) / "config.yaml"
-    if not config_path.exists():
-        print("  ❌ config.yaml 不存在")
-        return False
+    """检查项目根目录 .env 是否已配置"""
+    proj_root = Path(project_dir).resolve()
+    env_path = proj_root / ".env"
+    env_example = proj_root / ".env.example"
 
-    # 简单检查 — 不实际解析，只检查是否有 your- 占位符
-    with open(config_path) as f:
+    if not env_path.exists():
+        print("  ⚠️  .env 不存在")
+        if env_example.exists():
+            print(f"     提示: cp {env_example} .env  然后填入密钥")
+        return True  # 不阻塞，首次运行会报明确错误
+
+    with open(env_path) as f:
         content = f.read()
 
     issues = []
-    if "your-notion-api-key" in content:
+    if "NOTION_API_KEY=ntn_xxxxxxxx" in content or "NOTION_API_KEY=your-" in content:
         issues.append("Notion API Key 未配置")
-    if "your-wechat-app-id" in content:
+    if "WECHAT_APP_ID=wxXXXXXXXXXXXXXXX" in content or "WECHAT_APP_ID=your-" in content:
         issues.append("微信 App ID 未配置")
-    if "your-wechat-app-secret" in content:
-        issues.append("微信 App Secret 未配置")
-    if "your-zhihu-cookie" in content:
-        issues.append("知乎 Cookie 未配置")
 
     if issues:
-        print(f"  ⚠️  配置项未填写: {', '.join(issues)}")
-        print("     提示: 在 config.yaml 或 .env 中填入相应密钥")
-        # 不阻塞 — 用户可能只想用到部分功能
+        print(f"  ⚠️  密钥未填写: {', '.join(issues)}")
+        print(f"     编辑 {env_path} 填入真实密钥")
     else:
-        print("  ✅ config.yaml 配置已填写")
+        print("  ✅ .env 密钥已配置")
 
     return True
 

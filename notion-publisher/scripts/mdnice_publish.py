@@ -4,27 +4,20 @@ Notion → mdnice → 微信公众号 全自动发布
 
 流程:
   1. 从 Notion 拉取页面 → 导出 Markdown
-  2. 图片下载到本地 + 上传微信 CDN
-  3. mdnice.com: 新建文章 → 粘贴 Markdown → 渲染 → 提取 HTML
-  4. 微信 Draft API: 直接创建草稿（保留全部格式 + 图片）
+  2. 图片并发下载到本地
+  3. mdnice.com: 新建文章 → 粘贴 Markdown → 等待真实渲染 → 复制到微信
+  4. 微信后台: 粘贴 → 插入图片 → 保存草稿
 
 前置条件:
-  - Notion API Key (config.yaml / .env)
+  - 项目根目录 .env (NOTION_API_KEY 等)
   - mdnice 登录 Cookie（首次自动扫码，Cookie 持久化）
-  - 微信公众平台 AppID/AppSecret（config.yaml / .env）
+  - 微信公众平台 Cookie（首次自动扫码，Cookie 持久化）
 
 用法:
-  # 方式一：直接贴 Notion 链接
-  python scripts/mdnice_publish.py https://www.notion.so/sunkx109/Title-1af24043556480cfad2dc64212758475
-
-  # 方式二：标题 + page_id
+  python scripts/mdnice_publish.py https://app.notion.com/p/Title-1af2...
   python scripts/mdnice_publish.py "文章标题" <notion-page-id>
-
-  # 跳过 mdnice 渲染，直接发布已有 Markdown 文件
-  python scripts/mdnice_publish.py --md-file article.md "文章标题"
-
-  # 仅渲染，不发布
-  python scripts/mdnice_publish.py --dry-run "文章标题" <notion-page-id>
+  python scripts/mdnice_publish.py --md-file article.md "标题"
+  python scripts/mdnice_publish.py --dry-run "标题" <page-id>
 """
 
 import argparse
@@ -32,24 +25,105 @@ import asyncio
 import os
 import re
 import sys
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import requests
 from playwright.async_api import async_playwright
 
-# 技能目录（notion-publisher/）
-ROOT = Path(__file__).parent.parent
-sys.path.insert(0, str(ROOT))
+# ═══ 路径: 区分 skill 目录 vs 项目根 ═══
+# 脚本位置: <PROJ_ROOT>/notion-publisher/scripts/mdnice_publish.py
+SKILL_DIR = Path(__file__).parent.parent          # notion-publisher/
+PROJ_ROOT = SKILL_DIR.parent                       # notion-to-wechat/ (项目根)
+sys.path.insert(0, str(SKILL_DIR))
+
+# ═══ 输出目录都在项目根 ═══
+MDS_DIR = PROJ_ROOT / "mds"
+QR_DIR = PROJ_ROOT / "login_img"
+MDS_DIR.mkdir(exist_ok=True)
+QR_DIR.mkdir(exist_ok=True)
+
+WECHAT_STORAGE = str(PROJ_ROOT / "wechat_storage.json")
+MDNICE_STORAGE = str(PROJ_ROOT / "mdnice_storage.json")
+
+
+# ═══════════════════════════════════════════════════════════════
+# 工具函数
+# ═══════════════════════════════════════════════════════════════
+
+def now():
+    return time.strftime("%H:%M:%S")
+
+def log(msg: str):
+    print(f"[{now()}] {msg}", flush=True)
+
+
+async def wait_for(page, condition_desc: str, check_fn, timeout: float = 10.0, interval: float = 0.3):
+    """主动轮询等待条件满足，实时输出进度"""
+    start = time.time()
+    last_msg = 0
+    while True:
+        elapsed = time.time() - start
+        if elapsed > timeout:
+            log(f"   ⚠️  等待超时 ({timeout}s): {condition_desc}")
+            return None
+        try:
+            result = await check_fn()
+            if result:
+                if elapsed > 0.5:
+                    log(f"   ✅ {condition_desc} (耗时 {elapsed:.1f}s)")
+                return result
+        except Exception:
+            pass
+        if elapsed - last_msg > 3:
+            log(f"   ⏳ {condition_desc} ({elapsed:.0f}s/{timeout}s)")
+            last_msg = elapsed
+        await asyncio.sleep(interval)
+
+
+async def wait_for_selector(page, selector: str, timeout: float = 10.0):
+    async def check():
+        try:
+            return await page.locator(selector).first.is_visible()
+        except Exception:
+            return False
+    return await wait_for(page, f"可见 [{selector}]", check, timeout, interval=0.2)
+
+
+# ═══════════════════════════════════════════════════════════════
+# Notion 导出 — 图片并发下载
+# ═══════════════════════════════════════════════════════════════
+
+def _download_single_image(args: tuple) -> tuple[int, str | None, str | None, int]:
+    """下载单张图片（线程池用）"""
+    i, url, img_dir = args
+    try:
+        resp = requests.get(url, timeout=15)
+        ext = ".png"
+        ct = resp.headers.get("content-type", "")
+        if "jpeg" in ct or "jpg" in ct:
+            ext = ".jpg"
+        elif "gif" in ct:
+            ext = ".gif"
+        elif "webp" in ct:
+            ext = ".webp"
+        local_path = str(img_dir / f"img_{i:02d}{ext}")
+        with open(local_path, "wb") as f:
+            f.write(resp.content)
+        return (i, url, local_path, len(resp.content))
+    except Exception as e:
+        return (i, url, None, 0)
 
 
 def get_markdown_and_images(page_id: str) -> tuple[str, str, list[tuple[str, str]]]:
-    """从 Notion 拉取页面，导出 Markdown，同时下载所有图片到本地。
-    返回 (markdown, title, [(original_url, local_path), ...])
-    """
+    """从 Notion 拉取页面 → 导出 Markdown → 并发下载图片"""
     from src.notion_client import NotionClient
     from src.utils import load_config
 
-    config = load_config(str(ROOT / "config.yaml"))
+    log(f"📥 从 Notion 拉取页面: {page_id}")
+
+    config = load_config(str(SKILL_DIR / "config.yaml"))
     notion = NotionClient(api_key=config["notion"]["api_key"])
 
     page = notion.get_page(page_id)
@@ -67,12 +141,13 @@ def get_markdown_and_images(page_id: str) -> tuple[str, str, list[tuple[str, str
             title = "".join(t.get("plain_text", "") for t in p.get("title", []))
             break
     title = title or page_id[:8]
+    log(f"   标题: {title[:64]}")
 
     from src.notion2md import convert_json_to_markdown
 
     md = convert_json_to_markdown({"blocks": blocks})
+    log(f"   Markdown: {len(md):,} 字符, {len(blocks)} blocks")
 
-    # 提取所有图片 URL
     def extract_images(blist):
         result = []
         for b in blist:
@@ -88,41 +163,36 @@ def get_markdown_and_images(page_id: str) -> tuple[str, str, list[tuple[str, str
         return result
 
     image_urls = extract_images(blocks)
+    log(f"   图片: {len(image_urls)} 张")
 
-    # 下载图片到本地 mds/<title>/images/
     safe_title = re.sub(r"[^\w一-鿿]", "_", title)[:30]
-    article_dir = ROOT / "mds" / safe_title
+    article_dir = MDS_DIR / safe_title
     img_dir = article_dir / "images"
     img_dir.mkdir(parents=True, exist_ok=True)
 
-    # 保存 Markdown 到 mds/<title>/article.md
-    md_path = article_dir / "article.md"
-    with open(md_path, "w", encoding="utf-8") as f:
-        f.write(md)
-    print(f"   📄 Markdown → {md_path}")
-
+    # ── 并发下载图片 ──
     image_pairs = []
-    local_rel_paths = []  # 相对于 article.md 的图片路径
-    for i, url in enumerate(image_urls):
-        try:
-            resp = requests.get(url, timeout=30)
-            ext = ".png"
-            ct = resp.headers.get("content-type", "")
-            if "jpeg" in ct or "jpg" in ct:
-                ext = ".jpg"
-            elif "gif" in ct:
-                ext = ".gif"
-            local_path = str(img_dir / f"img_{i:02d}{ext}")
-            with open(local_path, "wb") as f:
-                f.write(resp.content)
-            image_pairs.append((url, local_path))
-            local_rel_paths.append(f"images/img_{i:02d}{ext}")
-            print(f"   📥 图片 {i}: {len(resp.content):,} bytes → {local_path}")
-        except Exception as e:
-            print(f"   ⚠️  图片 {i} 下载失败: {e}")
-            local_rel_paths.append("")  # 占位，保持索引一致
+    local_rel_paths = [""] * max(len(image_urls), 1)
 
-    # 在 Markdown 中用相对路径替换 Notion 图片 URL → 保存
+    if image_urls:
+        t0 = time.time()
+        tasks = [(i, url, img_dir) for i, url in enumerate(image_urls)]
+        with ThreadPoolExecutor(max_workers=min(8, len(tasks))) as pool:
+            futures = {pool.submit(_download_single_image, t): t for t in tasks}
+            for future in as_completed(futures):
+                i, url, local_path, size = future.result()
+                if local_path:
+                    image_pairs.append((url, local_path))
+                    local_rel_paths[i] = f"images/img_{i:02d}{os.path.splitext(local_path)[1]}"
+                    log(f"   📥 图片 {i}: {size:,} bytes")
+                else:
+                    log(f"   ⚠️  图片 {i} 下载失败")
+
+        # 按原始顺序排序
+        image_pairs.sort(key=lambda x: image_urls.index(x[0]))
+        log(f"   下载完成: {time.time()-t0:.1f}s ({len(tasks)} 张并发)")
+
+    # 替换 Markdown 中的图片引用为本地相对路径
     md_for_file = md
     for i, (url, _) in enumerate(image_pairs):
         rel = local_rel_paths[i]
@@ -134,25 +204,18 @@ def get_markdown_and_images(page_id: str) -> tuple[str, str, list[tuple[str, str
         else:
             md_for_file = md_for_file.replace(url, rel)
 
-    # 保存 Markdown 到 mds/<title>/article.md（含相对路径图片）
     md_path = article_dir / "article.md"
     with open(md_path, "w", encoding="utf-8") as f:
         f.write(md_for_file)
-    print(f"   📄 Markdown → {md_path}")
+    log(f"   📄 已保存: {md_path}")
 
     return md, title, image_pairs
 
 
-def replace_images_with_placeholders(
-    markdown: str, image_pairs: list[tuple[str, str]]
-) -> str:
-    """将 Markdown 中的 Notion 图片 URL 替换为占位文本 [📷 图N]，
-    供 mdnice 渲染（mdnice 无法访问本地相对路径）。
-    导出的 article.md 用的是相对路径，与此无关。
-    """
-    for i, (url, local_path) in enumerate(image_pairs):
+def replace_images_with_placeholders(markdown: str, image_pairs: list) -> str:
+    """Markdown 图片 → [📷 图N] 占位符（mdnice 复制到微信时用）"""
+    for i, (url, _) in enumerate(image_pairs):
         placeholder = f"[📷 图{i}]"
-        # 匹配 Markdown 图片语法: ![caption](url)
         pattern = rf"!\[[^\]]*\]\({re.escape(url)}\)"
         if re.search(pattern, markdown):
             markdown = re.sub(pattern, placeholder, markdown)
@@ -161,31 +224,20 @@ def replace_images_with_placeholders(
     return markdown
 
 
-def get_markdown(page_id: str) -> tuple[str, str]:
-    """从 Notion 拉取页面并导出 Markdown。返回 (markdown, title)。
-    兼容旧接口，无图片下载功能。
-    """
-    md, title, _ = get_markdown_and_images(page_id)
-    return md, title
-
-
 # ═══════════════════════════════════════════════════════════════
-# 登录辅助
+# 登录
 # ═══════════════════════════════════════════════════════════════
-
-QR_DIR = ROOT / "login_img"
-QR_DIR.mkdir(exist_ok=True)
 
 LOGIN_URLS = {
     "wechat": {
         "url": "https://mp.weixin.qq.com/",
-        "storage": str(ROOT / "wechat_storage.json"),
+        "storage": WECHAT_STORAGE,
         "qr_file": str(QR_DIR / "wechat_qr.png"),
         "success_check": "/cgi-bin/home",
     },
     "mdnice": {
         "url": "https://editor.mdnice.com/",
-        "storage": str(ROOT / "mdnice_storage.json"),
+        "storage": MDNICE_STORAGE,
         "qr_file": str(QR_DIR / "mdnice_qr.png"),
         "success_check": None,
         "success_text": "微信扫码登录",
@@ -194,66 +246,53 @@ LOGIN_URLS = {
 
 
 async def login(platform: str):
-    """登录指定平台：展示二维码 → 等待扫码 → 自动刷新过期二维码 → 循环直到成功"""
+    """展示二维码 → 等待扫码 → 自动刷新 → Cookie 持久化"""
     cfg = LOGIN_URLS[platform]
     if os.path.exists(cfg["storage"]):
-        print(f"✅ {cfg['storage']} 已存在，使用已保存的登录状态。")
-        print(f"   如需重新登录，请先删除此文件。")
+        log(f"✅ {cfg['storage']} 已存在，跳过登录")
         return
 
-    print(f"\n{'='*60}")
-    print(f"🔐 需要登录 {platform.upper()}")
-    print(f"{'='*60}")
+    log(f"\n{'='*50}")
+    log(f"🔐 需要登录 {platform.upper()}")
+    log(f"{'='*50}")
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True, args=["--no-sandbox"])
-        context = await browser.new_context(
-            viewport={"width": 1920, "height": 1080}, locale="zh-CN"
-        )
+        context = await browser.new_context(viewport={"width": 1920, "height": 1080}, locale="zh-CN")
         page = await context.new_page()
 
-        round_num = 0
-        while True:
-            round_num += 1
+        for round_num in range(1, 99):
             if round_num > 1:
-                print(f"\n🔄 二维码可能已过期，刷新页面获取新二维码...")
-                await page.reload(wait_until="networkidle")
-                await asyncio.sleep(3)
+                log("🔄 刷新获取新二维码...")
+                await page.reload(wait_until="domcontentloaded")
+                await asyncio.sleep(1)
             else:
-                await page.goto(cfg["url"], wait_until="networkidle", timeout=60000)
-                await asyncio.sleep(5)
+                await page.goto(cfg["url"], wait_until="domcontentloaded", timeout=30000)
+                await asyncio.sleep(2)
 
-            # 保存截图（含二维码）
             await page.screenshot(path=cfg["qr_file"], full_page=True)
-            print(f"\n📱 二维码已保存: {cfg['qr_file']}")
-            print(f"   👆 请用微信扫描截图中的二维码")
-            print(f"⏳ 等待扫码中...（每 10 秒检测一次，二维码过期会自动刷新）")
+            log(f"📱 二维码: {cfg['qr_file']}")
+            log(f"⏳ 等待扫码 (每 2s 检测)...")
 
-            # 轮询检测登录状态
-            for attempt in range(12):  # 每轮最多等 120 秒
-                await asyncio.sleep(10)
-
-                # 检查是否已登录
-                logged_in = False
+            for _ in range(60):
+                await asyncio.sleep(2)
                 try:
                     if cfg["success_check"]:
                         logged_in = cfg["success_check"] in page.url
                     else:
                         body = await page.evaluate("() => document.body.innerText")
                         logged_in = cfg["success_text"] not in body
+                    if logged_in:
+                        log(f"✅ 扫码成功！")
+                        await asyncio.sleep(1)
+                        await context.storage_state(path=cfg["storage"])
+                        log(f"💾 Cookie → {cfg['storage']}")
+                        await browser.close()
+                        return
                 except Exception:
                     pass
 
-                if logged_in:
-                    print(f"\n✅ 扫码成功！登录 {platform}")
-                    await asyncio.sleep(3)
-                    await context.storage_state(path=cfg["storage"])
-                    print(f"💾 Cookie 已保存: {cfg['storage']}")
-                    await browser.close()
-                    return
-
-                elapsed = (attempt + 1) * 10
-                print(f"   ⏱️  已等待 {elapsed}s，尚未扫码...")
+            log("⏰ 本轮超时，自动刷新...")
 
         await browser.close()
 
@@ -262,327 +301,358 @@ async def login(platform: str):
 # 微信编辑器图片插入
 # ═══════════════════════════════════════════════════════════════
 
-
-async def _find_image_input_selector(page_wx) -> str:
-    """找到微信编辑器中图片上传用的 <input type=file> 的 selector。"""
-    result = await page_wx.evaluate("""() => {
-        const inputs = document.querySelectorAll('input[type="file"]');
-        for (const inp of inputs) {
-            const accept = (inp.accept || '').toLowerCase();
-            if (accept.includes('image') || accept.includes('png') || accept.includes('jpg')) {
-                // 返回唯一定位符
+async def _find_image_input(page_wx) -> str:
+    return await page_wx.evaluate("""() => {
+        for (const inp of document.querySelectorAll('input[type="file"]')) {
+            const a = (inp.accept || '').toLowerCase();
+            if (a.includes('image') || a.includes('png') || a.includes('jpg')) {
                 if (inp.id) return '#' + inp.id;
                 if (inp.name) return 'input[name="' + inp.name + '"]';
-                const cls = (inp.className || '').trim();
-                if (cls) return 'input.' + cls.split(' ').join('.');
                 return 'input[type="file"]';
             }
         }
         return '';
     }""")
-    return result
 
 
-async def insert_images_to_wechat_editor(page_wx, image_pairs: list[tuple[str, str]]):
-    """在微信编辑器中按序插入本地图片，替换 [📷 图N] 占位符。
-
-    流程：选中占位文本 → Backspace 删除 → 上传图片到 file input → 编辑器自动插入
-    """
-
-    # —— 先找图片文件 input ——
-    img_input_sel = await _find_image_input_selector(page_wx)
-    if not img_input_sel:
-        print("   ❌ 未找到微信编辑器的图片上传 input，跳过图片插入")
-        print("   💡 图片已保存到 images/ 目录，可在草稿箱手动插入")
+async def insert_images_to_wechat_editor(page_wx, image_pairs: list):
+    """在微信编辑器里按序替换 [📷 图N] 占位符为本地图片"""
+    sel = await _find_image_input(page_wx)
+    if not sel:
+        log("   ❌ 未找到图片上传 input，跳过")
         return
-    print(f"   🔍 图片上传 input: {img_input_sel}")
 
-    img_input = page_wx.locator(img_input_sel)
+    log(f"   🔍 图片 input: {sel}")
+    img_input = page_wx.locator(sel)
+    total_imgs = 0
 
-    for i, (notion_url, local_path) in enumerate(image_pairs):
+    for i, (_, local_path) in enumerate(image_pairs):
         if not os.path.exists(local_path):
-            print(f"   ⚠️  图片文件不存在: {local_path}")
+            log(f"   ⚠️  文件不存在: {local_path}")
             continue
 
         placeholder = f"[📷 图{i}]"
-        print(f"   🖼️  处理 {placeholder}...")
+        log(f"   🖼️  图{i}...")
 
-        # 1. 在 ProseMirror 编辑器中找到占位符并选中
+        # 选中占位符
         found = await page_wx.evaluate(
             """(ph) => {
                 const editors = document.querySelectorAll('.ProseMirror[contenteditable="true"]');
                 const e = editors[1] || editors[0];
                 if (!e) return false;
-
                 const text = e.textContent || '';
                 const idx = text.indexOf(ph);
                 if (idx === -1) return false;
-
                 const walker = document.createTreeWalker(e, NodeFilter.SHOW_TEXT);
-                let currentPos = 0;
-                let targetNode = null, targetOffset = 0;
+                let pos = 0, target = null, off = 0;
                 while (walker.nextNode()) {
-                    const node = walker.currentNode;
-                    const nodeText = node.textContent || '';
-                    if (currentPos + nodeText.length > idx && !targetNode) {
-                        targetNode = node;
-                        targetOffset = idx - currentPos;
-                        break;
-                    }
-                    currentPos += nodeText.length;
+                    const n = walker.currentNode;
+                    const nt = n.textContent || '';
+                    if (pos + nt.length > idx && !target) { target = n; off = idx - pos; break; }
+                    pos += nt.length;
                 }
-                if (!targetNode) return false;
-
-                const range = document.createRange();
-                range.setStart(targetNode, targetOffset);
-                range.setEnd(targetNode, targetOffset + ph.length);
-                const sel = window.getSelection();
-                sel.removeAllRanges();
-                sel.addRange(range);
-
-                targetNode.parentElement?.scrollIntoView({block: 'center'});
+                if (!target) return false;
+                const r = document.createRange();
+                r.setStart(target, off); r.setEnd(target, off + ph.length);
+                const s = window.getSelection(); s.removeAllRanges(); s.addRange(r);
                 return true;
-            }""",
-            placeholder,
-        )
+            }""", placeholder)
 
         if not found:
-            print(f"      ⚠️  占位符未找到，跳过")
+            log(f"      ⚠️  占位符未找到 (可能已被 mdnice 渲染合并)")
             continue
 
-        await asyncio.sleep(0.3)
-
-        # 2. 删除占位符文本
+        await asyncio.sleep(0.1)
         await page_wx.keyboard.press("Backspace")
-        await asyncio.sleep(0.2)
+        await asyncio.sleep(0.1)
 
-        # 3. 直接通过 file input 上传图片（编辑器会自动在光标位置插入）
         try:
             await img_input.set_input_files(local_path)
         except Exception as e:
-            print(f"      ⚠️  上传失败: {e}")
-            # 恢复占位符
+            log(f"      ⚠️  上传失败: {e}")
             await page_wx.keyboard.press("Control+z")
-            await asyncio.sleep(0.3)
+            await asyncio.sleep(0.1)
             continue
 
-        # 4. 等待上传完成
-        await asyncio.sleep(3)
-        img_count = await page_wx.evaluate(
-            '() => document.querySelectorAll(\'.ProseMirror[contenteditable="true"]\')[1]?.querySelectorAll("img").length || 0'
+        # 等待图片出现在编辑器中
+        ok = await wait_for(
+            page_wx, f"图{i}插入",
+            lambda: page_wx.evaluate(
+                """() => {
+                    const e = document.querySelectorAll('.ProseMirror[contenteditable="true"]')[1];
+                    return e ? e.querySelectorAll('img').length : 0;
+                }"""
+            ),
+            timeout=8.0, interval=0.3,
         )
-        print(f"      ✅ 已插入 (当前共 {img_count} 张)")
+        if ok:
+            total_imgs = ok if isinstance(ok, int) else total_imgs + 1
+            log(f"      ✅ 已插入")
+
+    log(f"   编辑器内图片: {total_imgs} 张")
 
 
 # ═══════════════════════════════════════════════════════════════
 # 主流程
 # ═══════════════════════════════════════════════════════════════
 
+async def publish(title: str = "", page_id: str = None, md_file: str = None, dry_run: bool = False):
+    overall_start = time.time()
 
-async def publish(title: str, page_id: str = None, md_file: str = None, dry_run: bool = False):
-    """完整发布流程"""
-    wechat_storage = str(ROOT / "wechat_storage.json")
-    mdnice_storage = str(ROOT / "mdnice_storage.json")
-
-    # 自动检测并登录（login 会循环等待直到成功）
+    # ── 登录检查 ──
     for platform in ["wechat", "mdnice"]:
-        storage = str(ROOT / f"{platform}_storage.json")
+        storage = WECHAT_STORAGE if platform == "wechat" else MDNICE_STORAGE
         if not os.path.exists(storage):
             await login(platform)
-            print(f"\n✅ {platform} 登录完成，继续发布...\n")
+            log(f"✅ {platform} 登录完成\n")
 
     # ── 获取 Markdown ──
-    image_local_paths = []  # [(notion_url, local_path), ...]
+    image_local_paths = []
     if md_file:
         with open(md_file, "r") as f:
             markdown = f.read()
-        print(f"📄 Markdown 文件: {md_file} ({len(markdown):,} 字符)")
+        log(f"📄 本地 Markdown: {md_file} ({len(markdown):,} 字符)")
     elif page_id:
         markdown, auto_title, image_local_paths = get_markdown_and_images(page_id)
         title = title or auto_title
-        # 上传图片到微信 CDN，Markdown 中用图片占位文本替代
         markdown = replace_images_with_placeholders(markdown, image_local_paths)
-        print(f"📥 Notion 导出: {len(markdown):,} 字符, {len(image_local_paths)} 张图片已保存")
+        log(f"📥 Notion 导出完成: {len(markdown):,} 字符, {len(image_local_paths)} 张图片")
     else:
-        print("❌ 请指定 --page-id 或 --md-file")
+        log("❌ 请指定 page_id 或 --md-file")
         return
 
     if not title:
-        print("❌ 请提供文章标题")
+        log("❌ 请提供文章标题")
         return
 
-    print(f"📝 标题: {title[:64]}")
+    log(f"📝 标题: {title[:64]}")
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True, args=["--no-sandbox"])
 
-        # ═══ Step 1: mdnice 渲染 ═══
-        print("\n" + "─" * 50)
-        print("1/3  mdnice 渲染...")
-        ctx = await browser.new_context(
-            storage_state=mdnice_storage,
-            viewport={"width": 1920, "height": 1080},
-            locale="zh-CN",
-        )
-        page = await ctx.new_page()
-        await page.goto("https://editor.mdnice.com/", wait_until="networkidle", timeout=60000)
-        await asyncio.sleep(5)
+        # ═══════════════════════════════════════════
+        # 1/3  mdnice 渲染
+        # ═══════════════════════════════════════════
+        log("\n" + "─" * 50)
+        log("📝 1/3  mdnice 渲染...")
 
-        # 关闭版本更新弹窗
-        await page.evaluate(
-            """() => document.querySelectorAll("button").forEach(
-                b => { if (b.textContent.includes("确")) b.click(); }
-            )"""
+        ctx = await browser.new_context(
+            storage_state=MDNICE_STORAGE,
+            viewport={"width": 1920, "height": 1080}, locale="zh-CN",
         )
-        await asyncio.sleep(2)
+        await ctx.grant_permissions(["clipboard-read", "clipboard-write"])
+        page = await ctx.new_page()
+
+        t0 = time.time()
+        await page.goto("https://editor.mdnice.com/", wait_until="domcontentloaded", timeout=30000)
+        await asyncio.sleep(1)
+        log(f"   页面加载: {time.time()-t0:.1f}s")
+
+        await wait_for_selector(page, ".add-btn", timeout=8.0)
+
+        # 关弹窗
+        try:
+            await page.evaluate(
+                """() => document.querySelectorAll("button").forEach(
+                    b => { if(/(确|知|关)/.test(b.textContent)) b.click(); })"""
+            )
+            await asyncio.sleep(0.2)
+        except Exception:
+            pass
 
         # 新建文章
-        await page.locator(".add-btn").click()
-        await asyncio.sleep(2)
+        t0 = time.time()
+        await page.locator(".add-btn").first.click()
+        await wait_for_selector(page, '.ant-modal input[placeholder="请输入标题"]', timeout=5.0)
         await page.locator('.ant-modal input[placeholder="请输入标题"]').fill(title[:64])
-        await asyncio.sleep(1)
+        await asyncio.sleep(0.2)
         await page.locator('.ant-modal button:has-text("新 增")').click()
-        await asyncio.sleep(3)
+        log(f"   新建文章: {time.time()-t0:.1f}s")
+        await asyncio.sleep(0.3)
 
-        # 激活编辑器 + 粘贴 Markdown
-        await page.mouse.click(400, 400)
-        await asyncio.sleep(2)
+        # ── 关键: 记录渲染前的 #nice 长度，确保真的发生了渲染 ──
+        baseline_len = await page.evaluate(
+            '() => { const n = document.querySelector("#nice"); return n ? n.innerHTML.length : 0; }'
+        )
+        log(f"   渲染前 #nice 基线: {baseline_len} 字符")
+
+        # ── 通过剪贴板粘贴 Markdown（模拟人工 Ctrl+V）──
+        t0 = time.time()
+        # 1. 将 markdown 写入系统剪贴板
         await page.evaluate(
-            "(md) => { document.querySelector('.CodeMirror').CodeMirror.setValue(md); }",
+            """(md) => navigator.clipboard.writeText(md)""",
             markdown,
         )
+        # 2. 点击 CodeMirror 编辑区获取焦点
+        cm_box = page.locator(".CodeMirror")
+        await cm_box.click()
+        await asyncio.sleep(0.2)
+        # 3. Ctrl+A 全选 → Ctrl+V 粘贴（触发 mdnice 完整事件链）
+        await page.keyboard.press("Control+a")
+        await asyncio.sleep(0.1)
+        await page.keyboard.press("Control+v")
+        await asyncio.sleep(0.3)
+        log(f"   粘贴 Markdown 到 CodeMirror: {time.time()-t0:.1f}s")
 
-        # 等待渲染
-        for _ in range(30):
-            await asyncio.sleep(2)
-            nice_len = await page.evaluate(
-                '() => document.querySelector("#nice")?.innerHTML?.length || 0'
-            )
-            if nice_len > 10000:
-                break
-
-        rendered_len = await page.evaluate(
-            '() => document.querySelector("#nice")?.innerHTML?.length || 0'
+        # ── 等待 #nice 真正渲染: 长度必须 > 基线 + 500 字符 ──
+        log("   等待 mdnice 真实渲染...")
+        t0 = time.time()
+        rendered_len = await wait_for(
+            page,
+            "mdnice 真实渲染完成",
+            lambda: page.evaluate(
+                f"""() => {{
+                    const n = document.querySelector("#nice");
+                    if (!n) return 0;
+                    const len = n.innerHTML.length;
+                    // 必须显著大于基线，且包含渲染产物（pre/code/img/math）
+                    const hasRendered = n.querySelector('pre, code, img, .katex, .mathjax, svg, table');
+                    return (len > {baseline_len} + 500 && hasRendered) ? len : 0;
+                }}"""
+            ),
+            timeout=45.0,
+            interval=0.5,
         )
-        print(f"   ✅ 渲染完成: {rendered_len:,} 字符")
 
-        # 点击「复制到微信公众号」
-        await page.locator(".nice-btn-wechat").click()
-        await asyncio.sleep(2)
-        print("   ✅ 已复制到剪贴板")
+        if rendered_len:
+            log(f"   ✅ 渲染完成: {rendered_len:,} 字符 (耗时 {time.time()-t0:.1f}s)")
+        else:
+            fallback_len = await page.evaluate(
+                '() => { const n = document.querySelector("#nice"); return n ? n.innerHTML.length : 0; }'
+            )
+            log(f"   ⚠️  渲染可能不完整: 当前 {fallback_len} 字符 (基线 {baseline_len})")
+
+        # 等 mdnice 自动保存（渲染后需要 2-3s 将内容持久化到服务器）
+        log("   等待 mdnice 自动保存...")
+        await asyncio.sleep(3)
+        log("   ✅ 自动保存完成")
+
+        # 复制到微信公众号
+        t0 = time.time()
+        await page.locator(".nice-btn-wechat").first.click()
+        await asyncio.sleep(0.5)
+        log(f"   ✅ 复制到剪贴板 ({time.time()-t0:.1f}s)")
 
         if dry_run:
-            print("\n🔍 Dry run — 不发布到微信")
-            await page.close()
-            await ctx.close()
-            await browser.close()
+            log("\n🔍 Dry run — 不发布到微信")
+            await page.close(); await ctx.close(); await browser.close()
+            log(f"\n⏱️  总耗时: {time.time()-overall_start:.1f}s")
             return
 
         await page.close()
         await ctx.close()
 
-        # ═══ Step 2: 微信粘贴 ═══
-        print("\n" + "─" * 50)
-        print("2/3  微信粘贴...")
+        # ═══════════════════════════════════════════
+        # 2/3  微信粘贴
+        # ═══════════════════════════════════════════
+        log("\n" + "─" * 50)
+        log("📋 2/3  微信粘贴...")
+
         ctx_wx = await browser.new_context(
-            storage_state=wechat_storage,
-            viewport={"width": 1920, "height": 1080},
-            locale="zh-CN",
+            storage_state=WECHAT_STORAGE,
+            viewport={"width": 1920, "height": 1080}, locale="zh-CN",
         )
         page_wx = await ctx_wx.new_page()
 
-        # 登录 + 获取 token
-        await page_wx.goto("https://mp.weixin.qq.com/", wait_until="domcontentloaded")
-        await asyncio.sleep(2)
+        t0 = time.time()
+        await page_wx.goto("https://mp.weixin.qq.com/", wait_until="domcontentloaded", timeout=30000)
+        await asyncio.sleep(0.5)
         token_match = re.search(r"token=(\d+)", page_wx.url)
         if not token_match:
-            print("❌ 微信 Cookie 过期，请重新登录: python mdnice_publish.py --login-wechat")
+            log("❌ Cookie 过期: python scripts/mdnice_publish.py --login-wechat")
             return
         token = token_match.group(1)
+        log(f"   微信后台: {time.time()-t0:.1f}s")
 
-        # 新建文章
         draft_url = (
             f"https://mp.weixin.qq.com/cgi-bin/appmsg"
             f"?t=media/appmsg_edit_v2&action=edit&isNew=1&type=77&lang=zh_CN&token={token}"
         )
-        await page_wx.goto(draft_url, wait_until="networkidle")
-        await asyncio.sleep(5)
+        await page_wx.goto(draft_url, wait_until="domcontentloaded", timeout=30000)
+        await asyncio.sleep(1)
+        log("   新建草稿页面就绪")
 
-        # 设置标题（第一个 ProseMirror）
+        # 标题
         await page_wx.evaluate(
             """(t) => {
                 const e = document.querySelectorAll('.ProseMirror[contenteditable="true"]')[0];
                 e.focus(); e.textContent = t;
                 e.dispatchEvent(new Event("input", {bubbles: true}));
-            }""",
-            title[:64],
-        )
-        await asyncio.sleep(1)
+            }""", title[:64])
+        await asyncio.sleep(0.2)
 
-        # Ctrl+V 粘贴（mdnice 已把内容复制到剪贴板）
+        # Ctrl+V
+        t0 = time.time()
         body_editor = page_wx.locator('.ProseMirror[contenteditable="true"]').nth(1)
         await body_editor.click()
-        await asyncio.sleep(1)
+        await asyncio.sleep(0.2)
         await page_wx.keyboard.press("Control+v")
-        await asyncio.sleep(5)
 
-        # 验证粘贴
-        verify = await page_wx.evaluate(
-            """() => {
-                const e = document.querySelectorAll('.ProseMirror[contenteditable="true"]')[1];
-                return {
-                    chars: e.textContent.length,
-                    pre: !!e.querySelector("pre"),
-                    img: e.querySelectorAll("img").length,
-                };
-            }"""
+        verify = await wait_for(
+            page_wx, "粘贴完成",
+            lambda: page_wx.evaluate(
+                """() => {
+                    const e = document.querySelectorAll('.ProseMirror[contenteditable="true"]')[1];
+                    return (e && e.textContent.length > 100) ? {
+                        chars: e.textContent.length,
+                        pre: !!e.querySelector("pre"),
+                        img: e.querySelectorAll("img").length,
+                    } : null;
+                }"""
+            ),
+            timeout=15.0, interval=0.3,
         )
-        print(f"   粘贴: {verify['chars']:,} 字符, 代码块={verify['pre']}, 图片={verify['img']}")
+        if verify:
+            log(f"   粘贴: {verify['chars']:,} 字符, pre={verify['pre']}, img={verify['img']} ({time.time()-t0:.1f}s)")
+        else:
+            log("   ⚠️  粘贴验证超时")
 
-        # ═══ Step 2.5: 插入图片 ═══
+        # ═══ 插入图片 ═══
         if image_local_paths:
-            print(f"\n   📷 插入 {len(image_local_paths)} 张图片...")
+            log(f"\n   📷 插入 {len(image_local_paths)} 张本地图片...")
+            t0 = time.time()
             await insert_images_to_wechat_editor(page_wx, image_local_paths)
+            log(f"   图片插入耗时: {time.time()-t0:.1f}s")
 
-        # ═══ Step 3: 保存 ═══
-        print("\n" + "─" * 50)
-        print("3/3  保存草稿...")
+        # ═══════════════════════════════════════════
+        # 3/3  保存草稿
+        # ═══════════════════════════════════════════
+        log("\n" + "─" * 50)
+        log("💾 3/3  保存草稿...")
 
         await page_wx.evaluate(
             """() => {
                 const b = Array.from(document.querySelectorAll("button"))
                     .find(x => x.textContent.includes("保存为草稿"));
                 if (b) b.click();
-            }"""
-        )
+            }""")
+        log("   已点击「保存为草稿」")
 
-        for i in range(25):
-            await asyncio.sleep(4)
-            # 处理合规检测弹窗
+        saved = False
+        for i in range(60):
+            await asyncio.sleep(0.5)
             await page_wx.evaluate(
-                """() => {
-                    document.querySelectorAll("button").forEach(b => {
-                        const t = b.textContent;
-                        if (/(仍要保存|确定|我知道了|继续|关闭)/.test(t)) b.click();
-                    });
-                }"""
-            )
+                """() => document.querySelectorAll("button").forEach(b => {
+                    if(/(仍要保存|确定|我知道了|继续|关闭)/.test(b.textContent)) b.click();
+                })""")
             if "appmsgid" in page_wx.url:
                 did = re.search(r"appmsgid=(\d+)", page_wx.url)
                 if did:
-                    print(f"\n✅ 草稿已保存!")
-                    print(f"   draft_id: {did.group(1)}")
-                    print(f"   登录 mp.weixin.qq.com → 草稿箱 查看")
+                    log(f"\n✅ 草稿已保存! draft_id: {did.group(1)}")
+                    log(f"   登录 mp.weixin.qq.com → 草稿箱 查看")
+                    saved = True
                     break
-        else:
-            print("\n⚠️  保存超时，但内容已粘贴到编辑器")
-            print("   请在浏览器中手动点击「保存为草稿」")
+            if i > 0 and i % 10 == 0:
+                log(f"   ⏳ 等待保存... ({i*0.5:.0f}s)")
+
+        if not saved:
+            log("\n⚠️  保存确认超时，请手动检查草稿箱")
 
         await ctx_wx.close()
         await browser.close()
 
-    print("\n" + "=" * 50)
-    print("🎉 完成!")
+    log(f"\n{'='*50}")
+    log(f"🎉 完成! 总耗时: {time.time()-overall_start:.1f}s")
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -590,71 +660,40 @@ async def publish(title: str, page_id: str = None, md_file: str = None, dry_run:
 # ═══════════════════════════════════════════════════════════════
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Notion → mdnice → 微信公众号 全自动发布",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-示例:
-  python scripts/mdnice_publish.py https://app.notion.com/p/Title-1af24043556480cfad2dc64212758475
-  python scripts/mdnice_publish.py "文章标题" 1af24043556480cfad2dc64212758475
-  python scripts/mdnice_publish.py --md-file article.md "标题"
-  python scripts/mdnice_publish.py --dry-run https://app.notion.com/p/...
-        """,
-    )
-    parser.add_argument(
-        "url_or_title", nargs="?", default="",
-        help="Notion 页面链接（自动提取标题 + page_id）或文章标题",
-    )
-    parser.add_argument(
-        "page_id", nargs="?", default=None,
-        help="Notion 页面 ID（如果第一个参数是标题而非链接）",
-    )
-    parser.add_argument("--md-file", default=None, help="直接使用已有 Markdown 文件")
-    parser.add_argument("--dry-run", action="store_true", help="仅 mdnice 渲染，不发布到微信")
-    parser.add_argument("--login-wechat", action="store_true", help="登录微信公众平台")
-    parser.add_argument("--login-mdnice", action="store_true", help="登录 mdnice")
+    parser = argparse.ArgumentParser(description="Notion → mdnice → 微信公众号 全自动发布")
+    parser.add_argument("url_or_title", nargs="?", default="")
+    parser.add_argument("page_id", nargs="?", default=None)
+    parser.add_argument("--md-file", default=None)
+    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--login-wechat", action="store_true")
+    parser.add_argument("--login-mdnice", action="store_true")
     args = parser.parse_args()
 
-    # 登录模式
     if args.login_wechat:
-        asyncio.run(login("wechat"))
-        return
+        asyncio.run(login("wechat")); return
     if args.login_mdnice:
-        asyncio.run(login("mdnice"))
-        return
+        asyncio.run(login("mdnice")); return
 
-    # 发布模式：解析 URL 或 title+page_id
     title = ""
     page_id = args.page_id
     md_file = args.md_file
     dry_run = args.dry_run
 
     if args.url_or_title:
-        # 判断是 Notion URL 还是标题
-        url_match = re.search(
+        for pat in [
             r"https?://(?:www\.)?notion\.so/[^/]*[?/](?:p/)?[^?]*?[?/]?([a-f0-9]{32})",
-            args.url_or_title,
-        )
-        if not url_match:
-            # 也匹配 app.notion.com/p/ 格式
-            url_match = re.search(
-                r"https?://app\.notion\.com/p/[^?]*-([a-f0-9]{32})",
-                args.url_or_title,
-            )
-        if url_match:
-            # 是 Notion 链接 → 提取 page_id，标题留空自动获取
-            page_id = url_match.group(1)
-            print(f"🔗 从链接提取 page_id: {page_id}")
-        elif not page_id:
-            # 不是链接，当作标题
-            title = args.url_or_title
+            r"https?://app\.notion\.com/p/[^?]*-([a-f0-9]{32})",
+        ]:
+            m = re.search(pat, args.url_or_title)
+            if m:
+                page_id = m.group(1)
+                log(f"🔗 page_id: {page_id}")
+                break
+        else:
+            if not page_id:
+                title = args.url_or_title
 
-    asyncio.run(publish(
-        title=title,
-        page_id=page_id,
-        md_file=md_file,
-        dry_run=dry_run,
-    ))
+    asyncio.run(publish(title=title, page_id=page_id, md_file=md_file, dry_run=dry_run))
 
 
 if __name__ == "__main__":
